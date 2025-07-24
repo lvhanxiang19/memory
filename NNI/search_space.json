@@ -1,0 +1,8 @@
+{
+    "k_num": {"_type": "choice", "_value": [128,256,512]},
+    "head":{"_type": "choice", "_value": [3]},
+    "memory_layer":{"_type": "choice", "_value": [ [1,6,10],[6,10],[1,10],[1,6]]},
+    "knn":{"_type":"choice","_value":[32,64]},
+    "value_lr":{"_type":"choice","_value":[1e-3,2e-3,5e-4]},
+    "gate":{"_type":"choice","_value":[0,1]}
+}

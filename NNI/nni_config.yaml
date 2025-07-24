@@ -1,0 +1,23 @@
+experimentName: ViT-tcifar100
+searchSpaceFile: ./search_space.json
+trialCommand: python /home/ipad_3d/jet/jet/moejet/NNI/nni_train.py
+trialCodeDirectory: /home/ipad_3d/jet/jet/
+trialGpuNumber: 4
+trialConcurrency: 1
+maxExperimentDuration: 72h
+maxTrialNumber: 100
+
+tuner:
+  name: TPE
+  class_args:
+    optimize_mode: maximize
+assessor:
+  name: Medianstop
+  classArgs:
+    optimize_mode: minimize
+    start_step: 128
+trainingService:
+  platform: local
+  useActiveGpu: True
+  gpuIndices: 0,1,2,3
+  maxTrialNumberPerGpu: 2

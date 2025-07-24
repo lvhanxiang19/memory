@@ -1,0 +1,515 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+from logging import getLogger
+import math
+from typing import Optional
+from dataclasses import dataclass
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.tensor.parallel import parallelize_module
+from .colwise_embedding_bag import ColwiseEmbeddingBag, xFormerEmbeddingBag
+from .conv1d import CausalDepthwiseConv1d
+import einx
+from einops import rearrange, repeat, reduce, pack, unpack
+from torch import nn, einsum
+logger = getLogger()
+
+
+@dataclass
+class ProductKeyArgs:
+    is_enabled: bool = False
+    layers: str = (
+        ""  # Which layers to have the memory with product key on (example "6,12")
+    )
+    mem_n_keys: int = 1024  # The number of keys in the memory.
+    mem_heads: int = 4  # Number of memory reading heads
+    mem_knn: int = 32  # Number of memory slots to read / update - k-NN to the query
+    mem_share_values: bool = True  # Share values across memories
+    mem_k_dim: int = 512  # Memory keys dimension
+    mem_v_dim: int = -1  # Memory values dimension (-1 for automatic output dimension)
+
+    swilu_projection: bool = False
+
+    value_fixed_lr: Optional[
+        float
+    ] = 0.001  # The learning rate for the value of the PK network
+    mem_gated: bool = False
+    peer_variant: bool = False
+
+
+class AttrDict(dict):
+    def __init__(self, *args, **kwargs):
+        super(AttrDict, self).__init__(*args, **kwargs)
+        self.__dict__ = self
+
+
+class HashingMemory(nn.Module):
+
+    VALUES = None
+    EVAL_MEMORY = True
+
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+
+        value_fixed_lr=None,  # added for xlformers and replaces mem_value_optimizer, set to None to use the same learning rate as the rest of the model
+
+       
+        # global parameters
+        mem_k_dim=512,  # Memory keys dimension
+        mem_v_dim=-1,  # Memory values dimension (-1 for automatic output dimension)
+        mem_heads=4,  # Number of memory reading heads
+        mem_knn=32,  # Number of memory slots to read / update - k-NN to the query
+        mem_share_values=False,  # Share values across memories
+        # keys
+        mem_n_keys=1024,  # Number of keys
+        # queries
+        mem_query_bias=True,  # Query MLP bias
+        mem_query_batchnorm=True,  # Query MLP batch norm
+        # gating
+        mem_gated=False,  # gated memory
+        # values initialization
+        # dropout
+        mem_input_dropout=0.0,  # Input dropout
+        mem_query_dropout=0.0,  # Query dropout
+        mem_value_dropout=0.1,  # Value dropout
+        # architecture
+        peer_variant=False,  # Replaces the PK memory with the PEER variant (Parameter Efficient Expert Retrieval)
+        token_wise=False,
+        swilu_projection=True,
+
+    ):
+        # Check parameters
+        # even number of key dimensions for product quantization
+        assert mem_k_dim >= 2
+
+        # dropout
+        assert 0 <= mem_input_dropout < 1
+        assert 0 <= mem_query_dropout < 1
+        assert 0 <= mem_value_dropout < 1
+
+        # PEER variant
+        assert not (
+            peer_variant and mem_v_dim > 0
+        ), f"Cannot use PEER variant with a value dimension different from the input dimension (mem_v_dim=-1)"
+
+        # dimensions
+        assert mem_k_dim % 2 == 0
+        assert mem_heads >= 2
+
+        # query batchnorm
+        if mem_query_batchnorm:
+            logger.warning(
+                "WARNING: if you use batch normalization, be sure that you use batches of sentences with the same size at training time. Otherwise, the padding token will result in incorrect mean/variance estimations in the BatchNorm layer."
+            )
+
+        # initialize
+        super().__init__()
+        self.use_peer_variant = peer_variant
+        self.token_wise=token_wise
+        # global parameters
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        # number of indices / entries in the memory
+        self.size = mem_n_keys**2
+        self.num_v=mem_n_keys
+        self.k_dim = mem_k_dim
+
+        self.v_dim = mem_v_dim if mem_v_dim > 0 else output_dim
+
+        # values initialization
+        self.swilu_proj = swilu_projection
+        self.v_proj = mem_v_dim > 0 or self.swilu_proj
+        self.heads = mem_heads
+        self.knn = mem_knn
+
+        # dropout
+        self.input_dropout = mem_input_dropout
+        self.query_dropout = mem_query_dropout
+        self.value_dropout = mem_value_dropout
+        #新增一个对每个key更新次数的计算，来追踪key的更新
+        
+        # initialize keys
+        self.keys = nn.Parameter(
+            torch.empty(2 * self.heads * int(self.size**0.5), self.k_dim // 2)#这里的key的维度是输入(q)的一半
+
+        )
+        
+        # optionally use the same values for all memories
+        self.mem_share_values = mem_share_values
+
+        self.original = not self.mem_share_values or HashingMemory.VALUES is None
+        
+        # initialize the values
+        if self.original:
+            if not self.use_peer_variant:  # PK
+                self.values =  xFormerEmbeddingBag(self.size, self.v_dim)
+                #self.values =  nn.Parameter(torch.randn(self.size, self.v_dim,dtype=torch.bfloat16))  #value初始化
+                HashingMemory.VALUES = self.values
+            else:  # PEER
+                self.values_u = nn.Embedding(self.size, self.v_dim)
+                self.values_v = nn.Embedding(self.size, self.v_dim)
+                HashingMemory.VALUES = self.values_u, self.values_v
+        else:
+            if not self.use_peer_variant:  # PK
+                self.values = None
+            else:  # PEER
+                self.values_u = None
+                self.values_v = None
+        self.value_fixed_lr = value_fixed_lr
+
+        if self.v_proj:
+            proj_input = mem_v_dim
+            if self.swilu_proj and proj_input < 0:
+                proj_input = output_dim
+            self.value_proj = torch.nn.Linear(proj_input, output_dim)
+        if self.swilu_proj:
+            self.swilu_projection = torch.nn.Linear(self.input_dim, proj_input)
+        # gated memory
+        self.gating = None
+        if mem_gated:
+            self.gating = torch.nn.Linear(input_dim, 1)
+
+        # query network
+        # layer sizes / number of features
+        l_sizes = (self.input_dim, self.heads * self.k_dim)
+
+        self.query_proj = QueryMLP(
+            self.input_dim,
+            self.heads,
+            self.k_dim,
+            l_sizes,
+            bias=mem_query_bias,
+            batchnorm=mem_query_batchnorm,
+        )    
+        if self.mem_share_values and not self.original:
+            if not self.use_peer_variant:
+                self.values = HashingMemory.VALUES
+            else:
+                self.values_u, self.values_v = HashingMemory.VALUES
+        self.reset_parameters()
+    
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        # keys
+        bound = 1 / math.sqrt(self.k_dim)
+        nn.init.uniform_(self.keys, a=-bound, b=bound)
+        # values
+        if self.original:
+            if not self.use_peer_variant:
+                nn.init.normal_(self.values.weight, mean=0, std=self.v_dim**-0.5)
+            else:
+                nn.init.normal_(self.values_u.weight, mean=0, std=self.v_dim**-0.5)
+                nn.init.normal_(self.values_v.weight, mean=0, std=self.v_dim**-0.5)
+        # queries
+        #nn.init.xavier_uniform_(self.query_proj.query_mlps[0].weight)
+        # value projection
+        if self.v_proj:
+            nn.init.normal_(self.value_proj.weight, mean=0, std=self.output_dim**-0.5)
+        if self.swilu_proj:
+            nn.init.normal_(
+                self.swilu_projection.weight, mean=0, std=self.output_dim**-0.5
+            )
+        # fixed learning rate:
+        if self.original:
+            if self.use_peer_variant:
+                for p in self.values_u.parameters():
+                    p.fixed_lr = self.value_fixed_lr
+                    p.pk_value_param = True
+                for p in self.values_v.parameters():
+                    p.fixed_lr = self.value_fixed_lr
+                    p.pk_value_param = True
+            else:
+                for p in self.values.parameters():
+                    p.fixed_lr = self.value_fixed_lr
+                    p.pk_value_param = True
+        if self.gating is not None:
+            nn.init.normal_(self.gating.weight, mean=0, std=self.input_dim**-0.5)
+
+    def forward(self, input):
+        """
+        Read from the memory.
+        """
+        B, T, C = input.shape
+        t=input
+        input = input.view(-1, self.input_dim)
+        # input dimensions
+        assert input.shape[-1] == self.input_dim
+        prefix_shape = input.shape[:-1]
+
+        # compute query / store it
+        bs = np.prod(prefix_shape)
+        input = F.dropout(
+            input, p=self.input_dropout, training=self.training
+        )  # input shape
+        query = self.query_proj(t)  # (bs * heads, k_dim)
+        query = F.dropout(
+            query, p=self.query_dropout, training=self.training
+        )  # (bs * heads, k_dim)
+        assert query.shape == (bs * self.heads, self.k_dim)
+
+        # get indices
+        knn = self.knn
+        if self.token_wise:
+         scores, indices= self.get_indices_token_wise(query, knn)  # (bs * heads, knn) ** 2
+        else:
+         scores, indices= self.get_indices_value_wise(query, knn)
+
+        # store indices / scores (eval mode only - for usage statistics)
+        if not self.training and HashingMemory.EVAL_MEMORY:
+             self.last_indices = indices.view(bs, self.heads, knn).detach().cpu()
+             self.last_scores = scores.view(bs, self.heads, knn).detach().cpu().float()
+
+        # re-scoring
+        #scores = F.softmax(scores.float(), dim=-1).type_as(scores)  # (bs * heads, knn)
+
+        # merge heads / knn (since we sum heads)
+        
+        indices = indices.view(bs, self.heads * knn)  # (bs, heads * knn)
+        scores = scores.view(bs, self.heads * knn) 
+        
+          
+        
+        if not self.use_peer_variant:
+            output=self.values(indices,scores)
+            print(output.shape)
+            if self.v_proj and not self.swilu_proj:
+                output = self.value_proj(output)
+            if self.swilu_proj:
+                output = self.value_proj(output * F.silu(self.swilu_projection(input)))
+        else:
+            u = self.values_u(indices)
+            x = torch.einsum(
+                "bh, blh->bl", input, u
+            )  # (bs, v_dim) , (bs, heads * knn, v_dim) -> (bs, heads * knn)
+            x = F.gelu(x)  # This can be either GeLU or ReLU
+            v = self.values_v(indices)
+            x = x * scores  # (bs, heads * knn)
+            output = torch.einsum(
+                "bl, blh->bh", x, v
+            )  # (bs, heads * knn) , (bs, heads * knn, v_dim) -> (bs, v_dim)
+
+        output = F.dropout(
+            output, p=self.value_dropout, training=self.training
+        )  # (bs, v_dim)
+
+        # reshape output
+        if len(prefix_shape) >= 2:
+            output = output.view(prefix_shape + (self.v_dim,))  # (..., v_dim)
+
+        if self.gating:
+            output = F.sigmoid(self.gating(input)) * output
+        output = output.view(B, T, -1)
+
+        return output
+
+
+    def get_indices_value_wise(self, query, knn):
+        assert query.dim() == 2 and query.size(1) == self.k_dim
+        
+        bs = len(query) // self.heads
+        query = query.view(-1, self.heads, self.k_dim)
+        half = self.k_dim // 2
+        k=int(bs*knn/self.num_v)
+        assert k*self.num_v==bs*knn
+        # keys : (heads, 2, n_keys, half)
+        # keys1 : (heads, n_keys, half)
+        keys = self.keys.view(self.heads, 2, -1, half) #head 代表多头
+        keys1 = keys[:, 0, :, :]
+        keys2 = keys[:, 1, :, :]
+        # split query for product quantization
+        q1 = query[:, :, :half]  # (bs, heads, half)  #将query一分为二
+        q2 = query[:, :, half:]  # (bs, heads, half)
+
+        # compute indices with associated scores
+        scores1 = torch.einsum(
+            "blh, lkh->blk", q1, keys1
+        )  # (bs , heads, n_keys ** 0,5)
+        scores2 = torch.einsum(
+            "blh, lkh->blk", q2, keys2
+        )  # (bs , heads, n_keys ** 0,5)
+        #score_r=scores1
+        #score_c=scores2
+        #score_c=F.softmax(score_c.float(),dim=2).type_as(scores1)
+        #score_c,i=score_c.topk(knn,dim=2,largest=True)
+        #score_r,i=score_r.topk(knn,dim=2,largest=True)
+        #score_r=F.softmax(score_r.float(),dim=2).type_as(scores2)
+        scores1, indices1 = scores1.topk(k, dim=0, largest=True) # (k, heads, n_key**0.5) 被行选中的token
+        #scores2, indices2 = scores2.topk(knn, dim=2, largest=True) 
+        scores2=torch.gather(scores2,dim=0,index=indices1) # (k, heads, n_key**0.5)
+        scores2,indices2=scores2.topk(1,dim=2,largest=True)# (k,heads,1) 每一行选中的token对应选中的一列 这里每一列先只选一个，减少一点显存，后续实验可以增加
+        scores=scores1+scores2 #(knn,head,n_keys**0.5)
+        indices=indices1*(self.num_v)+indices2
+        
+        '''all_scores = (
+            scores1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
+            + scores2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
+        ).view(
+            bs, self.heads, -1
+        )  # (bs, heads, knn ** 2)
+        all_indices = (
+            indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
+            * n_keys
+            + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
+        ).view(
+            bs, self.heads, -1
+        )  # (bs, heads, knn ** 2)
+
+        # select overall best scores and indices
+        scores, best_indices = torch.topk(
+            all_scores, k=knn, dim=2, largest=True, sorted=True
+        )  # (bs, heads, knn)
+        indices = all_indices.gather(2, best_indices)  # (bs, knn)
+
+        # return scores with indices'''
+        assert scores.shape == indices.shape == (k, self.heads, self.num_v)
+        return scores.view(bs * self.heads, knn), indices.view(bs * self.heads, knn)
+
+
+
+    def get_indices_token_wise(self, query, knn):
+        assert query.dim() == 2 and query.size(1) == self.k_dim
+        bs = len(query) // self.heads
+        query = query.view(-1, self.heads, self.k_dim)
+        half = self.k_dim // 2
+        # keys : (heads, 2, n_keys, half)
+        # keys1 : (heads, n_keys, half)
+        keys = self.keys.view(self.heads, 2, -1, half) #head 代表多头
+        keys1 = keys[:, 0, :, :]
+        keys2 = keys[:, 1, :, :]
+        n_keys = len(keys[0][0])
+
+       
+
+        # split query for product quantization
+        q1 = query[:, :, :half]  # (bs, heads, half)  #将query一分为二
+        q2 = query[:, :, half:]  # (bs, heads, half)
+
+        # compute indices with associated scores
+        scores1 = torch.einsum(
+            "blh, lkh->blk", q1, keys1
+        )  # (bs , heads, n_keys ** 0,5)
+        scores2 = torch.einsum(
+            "blh, lkh->blk", q2, keys2
+        )  # (bs , heads, n_keys ** 0,5)
+        
+        scores1, indices1 = scores1.topk(knn, dim=2, largest=True)  # (bs, heads, knn)
+        scores2, indices2 = scores2.topk(knn, dim=2, largest=True)  # (bs, heads, knn)
+
+        all_scores = (
+            scores1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
+            + scores2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
+        ).view(
+            bs, self.heads, -1
+        )  # (bs, heads, knn ** 2)
+        all_indices = (
+            indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
+            * n_keys
+            + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
+        ).view(
+            bs, self.heads, -1
+        )  # (bs, heads, knn ** 2)
+
+        # select overall best scores and indices
+        scores, best_indices = torch.topk(
+            all_scores, k=knn, dim=2, largest=True, sorted=True
+        )  # (bs, heads, knn)
+        indices = all_indices.gather(2, best_indices)  # (bs, knn)
+
+        # return scores with indices
+        assert scores.shape == indices.shape == (bs, self.heads, knn)
+        return scores.view(bs * self.heads, knn), indices.view(bs * self.heads, knn)
+
+class QueryMLP(nn.Module):
+    def __init__(self, input_dim, heads, k_dim, sizes, bias=False, batchnorm=False):
+        super().__init__()
+        self.input_dim = input_dim
+        self.heads = heads
+        self.k_dim = k_dim
+        self.sizes = sizes
+        assert sizes[0] == input_dim
+        assert sizes[-1] == (heads * k_dim)
+        
+        #self.query_mlps = QueryMLP.mlp(sizes, bias=bias, batchnorm=batchnorm)
+        self.query_mlps = CausalDepthwiseConv1d(in_channels=sizes[0],out_channels=sizes[1],kernel_size=3)
+    @staticmethod
+    def mlp(sizes, bias=True, batchnorm=True):
+        """
+        Generate a feedforward neural network.
+        """
+        assert len(sizes) >= 2
+        pairs = [(sizes[i], sizes[i + 1]) for i in range(len(sizes) - 1)]
+        layers = []
+        
+        layers.append(nn.Linear(
+           in_features=sizes[0],out_features=sizes[1]
+        ))
+                
+        if batchnorm:
+            layers.append(nn.BatchNorm1d(sizes[1]))
+            
+            layers.append(nn.ReLU())
+
+        return nn.Sequential(*layers)
+    def forward(self, input):
+        """
+        Compute queries using either grouped 1D convolutions or ModuleList + concat.
+        """
+
+        
+
+        assert input.shape[-1] == self.input_dim
+        input = (
+            input.contiguous() if input.dim() > 2 else input
+        )
+        bs = len(input)*len(input[0])
+
+        device=input.device
+        query = self.query_mlps(input)
+        query=nn.LayerNorm(self.sizes[1],eps=1e-6).to(device)(query)
+        query=nn.ReLU()(query).view(-1,self.sizes[1])
+        
+        
+        assert query.shape == (bs, self.heads * self.k_dim)
+        return query.contiguous().view(bs * self.heads, self.k_dim)
+ # (bs , heads, n_keys ** 0,5)
+
+
+class z_loss(nn.Module):
+    def __init__(self,
+                 bs,
+                 head,
+                 n_keys,**kwargs):
+        super().__init__()
+        self.bs=bs
+        self.head=head
+        self.n_keys=n_keys
+        self.scalar_param = nn.Parameter(torch.tensor(0.0), requires_grad=True)##加入了一个学习参数，毕竟行标签和列标签肯定不一样吗
+    def forward(self,score1,score2):
+        assert score1.shape==(self.bs,self.head,self.n_keys)
+        assert score2.shape==(self.bs,self.head,self.n_keys)
+        loss_1=torch.logsumexp(score1,dim=2)
+        loss_2=torch.logsumexp(score2,dim=2)
+        loss_1=loss_1.mean()
+        loss_2=loss_2.mean()
+        p=torch.sigmoid(self.scalar_param)
+        loss_z=p*loss_1+(1-p)*loss_2
+        return loss_z
+
+
+
+        
+        
+
+        
+
+
+
+      
+
+ 
+        
