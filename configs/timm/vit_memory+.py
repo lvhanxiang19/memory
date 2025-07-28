@@ -32,7 +32,7 @@ model = dict(
     mem_k_num=mem_k_num,
     mem_head=h,
     mem_layer=layers,
-    mem_knn=32,
+    mem_knn=16,
     is_peer=is_peer,
     
     loss=dict(type='LabelSmoothLoss', label_smooth_val=0.1, mode='original'),
@@ -62,11 +62,13 @@ optim_wrapper = dict(
     paramwise_cfg=dict(
         #layer_decay_rate=layer_decay_rate,
         custom_keys={
-                     
-                     'blocks.5.mlp.weight_down_embed': dict(lr_mult=0.25, decay_mult=0.9),
-                     'blocks.5.mlp.weight_up_embed': dict(lr_mult=0.25, decay_mult=0.9),
-                     'blocks.5.mlp.value': dict(lr_mult=0.25, decay_mult=0.9)
-                     
+                     'blocks.1.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
+                     'blocks.3.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
+                     'blocks.5.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
+                     'blocks.7.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
+                     'blocks.9.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
+                     'blocks.11.mlp.value': dict(lr_mult=0.25, decay_mult=0.9)
+
                      },
         norm_decay_mult=DECAY_MULT,
         bias_decay_mult=DECAY_MULT,

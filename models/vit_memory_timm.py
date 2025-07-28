@@ -49,6 +49,7 @@ from timm.models._manipulate import named_apply, checkpoint_seq, adapt_input_con
 from timm.models._registry import generate_default_cfgs, register_model, register_model_deprecations
 from ..utils.memory import HashingMemory
 from PEER_pytorch import PEER
+from ..utils.memory_all import memory
 
 __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to this
 
@@ -170,18 +171,16 @@ class Block(nn.Module):
             self.mlp=PEER(dim=dim,heads=4,num_experts_per_head=16,num_experts=448*448,is_new=True)
            
         if is_memory:
-            self.mlp=HashingMemory(
+            self.mlp=memory(
                 input_dim = mem_dim,
-                output_dim = mem_dim,
-                mem_n_keys = mem_k_num,
-                mem_heads= mem_head,
-                mem_knn= mem_knn,
-                mem_share_values= False,
-                mem_k_dim= mem_k_dim//2,
-                mem_v_dim = -1,
-                swilu_projection= True,
-                value_fixed_lr= value_lr,
-                peer_variant = False,
+                output_dim= dim,
+                key_num= mem_k_num,
+                heads= mem_head,
+                knn= mem_knn,
+                key_dim= mem_k_dim,
+                value_dim = -1,
+                
+                value_proj=True,
             )
         if not is_memory and not is_peer:
             self.mlp = mlp_layer(

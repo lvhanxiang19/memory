@@ -79,7 +79,7 @@ class HashingMemory(nn.Module):
         mem_value_dropout=0.1,  # Value dropout
         # architecture
         peer_variant=False,  # Replaces the PK memory with the PEER variant (Parameter Efficient Expert Retrieval)
-        token_wise=False,
+        
         swilu_projection=True,
 
     ):
@@ -110,7 +110,7 @@ class HashingMemory(nn.Module):
         # initialize
         super().__init__()
         self.use_peer_variant = peer_variant
-        self.token_wise=token_wise
+        
         # global parameters
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -254,10 +254,9 @@ class HashingMemory(nn.Module):
 
         # get indices
         knn = self.knn
-        if self.token_wise:
-         scores, indices= self.get_indices_token_wise(query, knn)  # (bs * heads, knn) ** 2
-        else:
-         scores, indices= self.get_indices_value_wise(query, knn)
+        
+        scores, indices= self.get_indices(query, knn)  # (bs * heads, knn) ** 2
+        
 
         # store indices / scores (eval mode only - for usage statistics)
         if not self.training and HashingMemory.EVAL_MEMORY:
@@ -308,70 +307,11 @@ class HashingMemory(nn.Module):
         return output
 
 
-    def get_indices_value_wise(self, query, knn):
-        assert query.dim() == 2 and query.size(1) == self.k_dim
-        
-        bs = len(query) // self.heads
-        query = query.view(-1, self.heads, self.k_dim)
-        half = self.k_dim // 2
-        k=int(bs*knn/self.num_v)
-        assert k*self.num_v==bs*knn
-        # keys : (heads, 2, n_keys, half)
-        # keys1 : (heads, n_keys, half)
-        keys = self.keys.view(self.heads, 2, -1, half) #head 代表多头
-        keys1 = keys[:, 0, :, :]
-        keys2 = keys[:, 1, :, :]
-        # split query for product quantization
-        q1 = query[:, :, :half]  # (bs, heads, half)  #将query一分为二
-        q2 = query[:, :, half:]  # (bs, heads, half)
-
-        # compute indices with associated scores
-        scores1 = torch.einsum(
-            "blh, lkh->blk", q1, keys1
-        )  # (bs , heads, n_keys ** 0,5)
-        scores2 = torch.einsum(
-            "blh, lkh->blk", q2, keys2
-        )  # (bs , heads, n_keys ** 0,5)
-        #score_r=scores1
-        #score_c=scores2
-        #score_c=F.softmax(score_c.float(),dim=2).type_as(scores1)
-        #score_c,i=score_c.topk(knn,dim=2,largest=True)
-        #score_r,i=score_r.topk(knn,dim=2,largest=True)
-        #score_r=F.softmax(score_r.float(),dim=2).type_as(scores2)
-        scores1, indices1 = scores1.topk(k, dim=0, largest=True) # (k, heads, n_key**0.5) 被行选中的token
-        #scores2, indices2 = scores2.topk(knn, dim=2, largest=True) 
-        scores2=torch.gather(scores2,dim=0,index=indices1) # (k, heads, n_key**0.5)
-        scores2,indices2=scores2.topk(1,dim=2,largest=True)# (k,heads,1) 每一行选中的token对应选中的一列 这里每一列先只选一个，减少一点显存，后续实验可以增加
-        scores=scores1+scores2 #(knn,head,n_keys**0.5)
-        indices=indices1*(self.num_v)+indices2
-        
-        '''all_scores = (
-            scores1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
-            + scores2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
-        ).view(
-            bs, self.heads, -1
-        )  # (bs, heads, knn ** 2)
-        all_indices = (
-            indices1.view(bs, self.heads, knn, 1).expand(bs, self.heads, knn, knn)
-            * n_keys
-            + indices2.view(bs, self.heads, 1, knn).expand(bs, self.heads, knn, knn)
-        ).view(
-            bs, self.heads, -1
-        )  # (bs, heads, knn ** 2)
-
-        # select overall best scores and indices
-        scores, best_indices = torch.topk(
-            all_scores, k=knn, dim=2, largest=True, sorted=True
-        )  # (bs, heads, knn)
-        indices = all_indices.gather(2, best_indices)  # (bs, knn)
-
-        # return scores with indices'''
-        assert scores.shape == indices.shape == (k, self.heads, self.num_v)
-        return scores.view(bs * self.heads, knn), indices.view(bs * self.heads, knn)
+    
 
 
 
-    def get_indices_token_wise(self, query, knn):
+    def get_indices(self, query, knn):
         assert query.dim() == 2 and query.size(1) == self.k_dim
         bs = len(query) // self.heads
         query = query.view(-1, self.heads, self.k_dim)
@@ -423,6 +363,10 @@ class HashingMemory(nn.Module):
         # return scores with indices
         assert scores.shape == indices.shape == (bs, self.heads, knn)
         return scores.view(bs * self.heads, knn), indices.view(bs * self.heads, knn)
+    
+    
+
+
 
 class QueryMLP(nn.Module):
     def __init__(self, input_dim, heads, k_dim, sizes, bias=False, batchnorm=False):
@@ -477,6 +421,8 @@ class QueryMLP(nn.Module):
         assert query.shape == (bs, self.heads * self.k_dim)
         return query.contiguous().view(bs * self.heads, self.k_dim)
  # (bs , heads, n_keys ** 0,5)
+
+
 
 
 class z_loss(nn.Module):
