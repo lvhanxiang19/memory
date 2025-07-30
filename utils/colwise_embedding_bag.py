@@ -43,10 +43,6 @@ class xFormerEmbeddingBag(nn.Module):
         else:
 
             weight = self.weight
-            '''if weight.dtype != torch.bfloat16:  # 确保权重类型正确
-                 weight = weight.to(torch.bfloat16)
-            if scores.dtype != torch.bfloat16:  # 确保权重类型正确
-                 scores = scores.to(torch.bfloat16)'''
             with torch.cuda.amp.autocast(enabled=False):
               output = F.embedding_bag(indices, weight.to(torch.float32), per_sample_weights=scores.to(torch.float32), mode="sum")
             

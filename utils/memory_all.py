@@ -27,24 +27,26 @@ class Memory_value(nn.Module):
             d = self.weight.size(1)
     
             # 步骤1: 提取知识库向量
-            gathered_vectors = self.weight[indices]  # (b, e, c, d)
+            gathered_vectors = (self.weight[indices]*(score.unsqueeze(-1))).view(b,-1,d)  # (b, e, c, d)
             
              # 步骤2: 应用得分权重
-            weighted_vectors = (gathered_vectors * score.unsqueeze(-1)).view(b,-1,d)  # (b, e, c, d)
-            # 步骤3: 按token编号散射重组
+            
             output = torch.zeros(b,n,d, device=self.weight.device)
             output.scatter_add_(
                 dim=1,
                 index=dispatch.view(b,-1).unsqueeze(-1).expand(-1, -1,d),
-                src=weighted_vectors
+                src=gathered_vectors
             )
 
             
         else:
-         score=score.unsqueeze(-1)  # (b,t,knn,1)
-         output=self.value[indices]*score
-         output=output.sum(dim=2)
-        return output
+         b, e, c = indices.shape
+         indices = indices.view(b * e, c)
+         score = score.view(b * e, c)
+         weight = self.weight
+         with torch.cuda.amp.autocast(enabled=False):
+              output = F.embedding_bag(indices, weight.to(torch.float32), per_sample_weights=score.to(torch.float32), mode="sum")
+        return output.view(b, n, -1)  # (b, n, d)
 
 class CausalDepthwiseConv1d(nn.Module):
     def __init__(self, in_channels, kernel_size=3, dilation_rate=1):
@@ -58,7 +60,6 @@ class CausalDepthwiseConv1d(nn.Module):
             padding=padding,
             dilation=dilation_rate,
             groups=in_channels,
-            
         )
 
     def forward(self, x):
@@ -313,7 +314,7 @@ class memory(nn.Module):
             batch_norm=False,
             query_dropout=0.0,
             ##other setting
-            value_proj=True,
+            value_proj=False,
             value_proj_bias=True,
             swilu_proj=True,
             swilu_bias=True

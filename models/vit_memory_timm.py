@@ -171,16 +171,27 @@ class Block(nn.Module):
             self.mlp=PEER(dim=dim,heads=4,num_experts_per_head=16,num_experts=448*448,is_new=True)
            
         if is_memory:
-            self.mlp=memory(
+            '''self.mlp=HashingMemory(
                 input_dim = mem_dim,
                 output_dim= dim,
-                key_num= mem_k_num,
-                heads= mem_head,
-                knn= mem_knn,
-                key_dim= mem_k_dim,
-                value_dim = -1,
+                mem_n_keys= mem_k_num,
+                mem_heads= mem_head,
+                mem_knn= mem_knn,
+                mem_k_dim= mem_k_dim,
+                mem_v_dim= -1,
                 
-                value_proj=True,
+                swilu_projection=True,
+            )'''
+            self.mlp=memory(
+                input_dim=dim, 
+                output_dim=dim,
+                key_num=mem_k_num,
+                key_dim=mem_k_dim,
+                value_dim=-1,
+                heads=mem_head,
+                knn=mem_knn,
+                block_rate=8,
+                router_type='block_wise'
             )
         if not is_memory and not is_peer:
             self.mlp = mlp_layer(

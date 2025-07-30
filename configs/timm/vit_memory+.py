@@ -14,10 +14,10 @@ is_peer=False
 layers=[1,3,5,7,9,11]
 total_batch = 512
 lr = 4e-3
-bs = 128
+bs = 32
 h=4
 
-accumulative_counts = 1
+accumulative_counts = 2
 model = dict(
     type='TimmClassifier',
 
@@ -32,7 +32,7 @@ model = dict(
     mem_k_num=mem_k_num,
     mem_head=h,
     mem_layer=layers,
-    mem_knn=16,
+    mem_knn=32,
     is_peer=is_peer,
     
     loss=dict(type='LabelSmoothLoss', label_smooth_val=0.1, mode='original'),
@@ -61,15 +61,12 @@ optim_wrapper = dict(
 
     paramwise_cfg=dict(
         #layer_decay_rate=layer_decay_rate,
-        custom_keys={
-                     'blocks.1.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
+        custom_keys={'blocks.1.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
                      'blocks.3.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
                      'blocks.5.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
                      'blocks.7.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
                      'blocks.9.mlp.value': dict(lr_mult=0.25, decay_mult=0.9),
-                     'blocks.11.mlp.value': dict(lr_mult=0.25, decay_mult=0.9)
-
-                     },
+                     'blocks.11.mlp.value': dict(lr_mult=0.25, decay_mult=0.9)},
         norm_decay_mult=DECAY_MULT,
         bias_decay_mult=DECAY_MULT,
         bypass_duplicate=True,
@@ -104,9 +101,14 @@ name='lhx'
 # ]
 
 train_cfg = dict(by_epoch=True, max_epochs=300, val_interval=1)
-val_cfg = dict()
-test_cfg = dict()
-
+train_dataloader = dict(
+    batch_size=bs,  
+    num_workers=8,)
+val_dataloader = dict(
+    batch_size=bs,  
+    num_workers=8,)
+val_cfg=dict()
+test_cfg=dict()
 randomness = dict(seed=3407, deterministic=False)
 env_cfg = dict(
     # whether to enable cudnn benchmark
