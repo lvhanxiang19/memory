@@ -14,10 +14,10 @@ is_peer=False
 layers=[1,3,5,7,9,11]
 total_batch = 512
 lr = 4e-3
-bs = 32
+bs = 64
 h=4
 
-accumulative_counts = 2
+accumulative_counts = 1
 model = dict(
     type='TimmClassifier',
 

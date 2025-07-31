@@ -1,9 +1,9 @@
 from timm.models._registry import register_model
 from .vit_timm import _create_vision_transformer
 
-from .vit_new import _create_vision_transformer_new
+#from .vit_new import _create_vision_transformer_new
 from .vit_memory_timm import _create_vision_transformermemory
-from .vit_ultra import _create_vision_transformer_ultra 
+#from .vit_ultra import _create_vision_transformer_ultra 
 
 
 
@@ -48,7 +48,7 @@ def vit_tiny_mem_custom(pretrained=False, **kwargs): #5,543,716
 
     return model
 
-@register_model
+'''@register_model
 def vit_tiny_new_custom(pretrained=False, **kwargs): #5,543,716
     """ ViT-Tiny (Vit-Ti/16)
     """
@@ -62,4 +62,4 @@ def vit_tiny_ultra_custom(pretrained=False, **kwargs): #5,543,716
     model_kwargs = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3, **kwargs)
     model = _create_vision_transformer_ultra('vit_tiny_patch16_224', pretrained=pretrained, **model_kwargs)
 
-    return model
+    return model'''

@@ -18,27 +18,42 @@ class Memory_value(nn.Module):
         self.value_dim=value_dim
         self.weight=nn.Parameter(torch.randn(value_size,value_dim))
         
-    def forward(self,score,indices,dispatch,n):
+    def forward(self,score,indices,dispatch,n,knn,h,block): #dispatch (b,e,c) 每个block选择的token的编号
         assert indices.dim()==3 
         assert score.dim()==3 
         if dispatch is not None:
             assert indices.dim()==3
-            b, e, c = indices.shape
-            d = self.weight.size(1)
-    
+            b, e, c = indices.shape 
+            d = self.weight.size(1) #(v,d)
+            
             # 步骤1: 提取知识库向量
-            gathered_vectors = (self.weight[indices]*(score.unsqueeze(-1))).view(b,-1,d)  # (b, e, c, d)
+            
             
              # 步骤2: 应用得分权重
-            
-            output = torch.zeros(b,n,d, device=self.weight.device)
+            gathered_vectors =(self.weight[indices]*(score.unsqueeze(-1))).view(b,-1,d)
+            output =torch.zeros(b,n,d, device=self.weight.device)#(b,n,d)
             output.scatter_add_(
                 dim=1,
-                index=dispatch.view(b,-1).unsqueeze(-1).expand(-1, -1,d),
-                src=gathered_vectors
-            )
-
-            
+                index=dispatch.view(b,-1).unsqueeze(-1).expand(-1,-1,d),#(b,e*c,d)
+                src=gathered_vectors) #(b,e,c,d)
+            '''i = torch.zeros(b,n,block*h, device=self.weight.device,dtype=indices.dtype) #(b,n,k)
+            s = torch.zeros(b,n,block*h, device=self.weight.device,dtype=score.dtype) #(b,n,k)
+            i.scatter_(
+                dim=1,
+                index=dispatch.view(b,-1).unsqueeze(-1).expand(-1, -1,block*h), #(b,e*c,d)
+                src=indices.view(b,-1).unsqueeze(-1).expand(-1,-1,block*h) #(b,e*c,k)
+            ) 
+            s.scatter_(
+                dim=1,
+                index=dispatch.view(b,-1).unsqueeze(-1).expand(-1, -1,block*h), #(b,e*c,k)
+                src=score.view(b,-1).unsqueeze(-1).expand(-1,-1,block*h) #(b,e*c,k)   
+            ) 
+            i=i.view(b*n,-1)
+            s=s.view(b*n,-1)
+            weight = self.weight
+            with torch.cuda.amp.autocast(enabled=False):
+              output = F.embedding_bag(i, weight.to(torch.float32), per_sample_weights=s.to(torch.float32), mode="sum")'''
+            return output.view(b, n, -1)
         else:
          b, e, c = indices.shape
          indices = indices.view(b * e, c)
@@ -333,6 +348,7 @@ class memory(nn.Module):
         else:
             self.value_dim = value_dim
         self.block_rate = block_rate
+        self.block= knn * block_rate
         self.router_typr = router_type
         self.swilu_projection = swilu_proj
         #初始化value_proj
@@ -399,7 +415,7 @@ class memory(nn.Module):
             assert indices.dim() == 3 
             
             #获取value
-            output = self.value(score=score, indices=indices, dispatch=dispatch,n=T)
+            output = self.value(score=score, indices=indices, dispatch=dispatch,n=T,knn=self.knn,h=self.heads,block=self.block)
             if self.value_proj:
                 output = self.value_proj(output.view(B, T, -1))
             if self.swilu_projection:

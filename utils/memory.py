@@ -8,9 +8,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor.parallel import parallelize_module
-from .colwise_embedding_bag import ColwiseEmbeddingBag, xFormerEmbeddingBag
+
+from .colwise_embedding_bag import  xFormerEmbeddingBag
 from .conv1d import CausalDepthwiseConv1d
 import einx
 from einops import rearrange, repeat, reduce, pack, unpack
